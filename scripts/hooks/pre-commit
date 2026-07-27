@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# Deflector pre-commit guard — keeps operator PII out of git.
+#
+# Install once:  git config core.hooksPath scripts/hooks
+#
+# Two checks:
+#   1. Refuse to commit private_config.py (the operator's real constants).
+#   2. Backstop: scan the staged diff for the operator's real identifiers. Those values are
+#      READ FROM the local, gitignored private_config.py at commit time — so this committed
+#      hook contains no real PII itself. On a clone without private_config.py, only check 1
+#      runs. Bypass in an emergency with `git commit --no-verify`.
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+
+# 1. never allow the private constants file itself
+if git diff --cached --name-only | grep -qx 'private_config.py'; then
+  echo "pre-commit: refusing to commit private_config.py (operator PII)." >&2
+  echo "            unstage it:  git restore --staged private_config.py" >&2
+  exit 1
+fi
+
+# 2. backstop scan (only if the local private file exists)
+[ -f "$repo_root/private_config.py" ] || exit 0
+
+tokens="$(cd "$repo_root" && python3 - <<'PY'
+try:
+    import private_config as c
+except Exception:
+    raise SystemExit(0)
+vals = [c.INTERNAL_DOMAIN, c.PRIVATE_TEST_IP, *c.OPERATOR_NAMES]
+# add the distinctive surname (last token of the canonical name); skip common first names
+if c.OPERATOR_NAMES:
+    parts = c.OPERATOR_NAMES[0].split()
+    if len(parts) >= 2:
+        vals.append(parts[-1])
+seen = set()
+for v in vals:
+    v = v.strip()
+    if len(v) >= 4 and v.lower() not in seen:
+        seen.add(v.lower())
+        print(v)
+PY
+)"
+[ -n "$tokens" ] || exit 0
+
+# Only ADDED lines (ignore '+++' headers and all deletions) — removing PII must be allowed.
+# Also skip intentional copyright/authorship notices: the operator publishes their own name as
+# the copyright holder on purpose, so a "Copyright (c) <name>" line must not trip the scan.
+# (A private IP or internal domain would never legitimately appear in such a line.)
+staged="$(git diff --cached -U0 --no-color \
+  | grep '^+' | grep -v '^+++' \
+  | grep -viE 'copyright[[:space:]]*(\(c\)|©|[0-9])' || true)"
+while IFS= read -r tok; do
+  [ -z "$tok" ] && continue
+  if printf '%s' "$staged" | grep -Fiq -- "$tok"; then
+    echo "pre-commit: staged changes contain operator PII ('$tok')." >&2
+    echo "            move it into private_config.py and reference it via private_ref." >&2
+    exit 1
+  fi
+done <<EOF
+$tokens
+EOF
+
+exit 0

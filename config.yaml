@@ -1,0 +1,54 @@
+upstream:
+  main: http://127.0.0.1:11434
+  tasks: http://127.0.0.1:11435
+  cloud: https://ollama.com
+  timeout_s: 900
+  cloud_timeout_s: 600
+
+routing:
+  main_models:
+    - pi-qwen3.6-128k
+    - llama4:latest
+    - qwen3.6:35b-a3b
+    - hermes-qwen3.6-64k:latest
+
+  hermes_model: hermes-qwen3.6-64k
+  hermes_cloud_model: nemotron-3-ultra:cloud
+
+  jarvis_models:
+    - lfm2.5:8b
+    - qwen3.5:4b
+    - glm-4.7-flash
+  jarvis_cloud_model: nemotron-3-ultra:cloud
+  jarvis_cloud_prefix: "cloud/jarvis"
+  jarvis_cloud_fallback: glm-4.7-flash
+
+  pressure_flag: /tmp/ai-routing.json
+  pressure_threshold_pct: 88
+
+  lifeos_prefixes:
+    lifeos-cloud-code: minimax-m3:cloud
+    lifeos-cloud-reason: nemotron-3-super:cloud
+    lifeos-cloud-long: minimax-m3:cloud
+  lifeos_local_fallback: qwen3.6:35b-a3b
+  lifeos_claude_marker: lifeos-claude
+
+claude:
+  # Bucket B (spec 03 §3a): cap in-flight `claude` CLI processes. Each Claude request
+  # spawns its own OS process (no pool); overflow QUEUES (awaits the semaphore), never
+  # errors, and this also protects the Anthropic five_hour rate limit.
+  max_concurrent_claude: 3
+
+thresholds:
+  max_tokens_per_request: 1048576
+  max_wall_seconds: 900
+  ngram_window: 64
+  ngram_size: 8
+  ngram_overlap_ratio: 0.7
+  min_tokens_per_second: 0.5
+  stall_grace_s: 30
+
+logging:
+  log_dir: ~/.agentstop/logs
+  log_kills: true
+  log_routing: true
