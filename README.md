@@ -1,8 +1,12 @@
-# Deflector
+# Privacy Deflector
 
-A privacy-and-efficiency gate for LLM traffic. Deflector sits in front of your model
+A privacy-and-efficiency gate for LLM traffic. Privacy Deflector sits in front of your model
 backends and speaks the Ollama HTTP API, so any Ollama-compatible client can point at it
 unchanged. Every request passes two gates before it ever reaches a model:
+
+> **Naming note:** the project's display name is "Privacy Deflector." Code-level identifiers
+> — the `X-Deflector-Mode` header, service labels, module/package names — remain `deflector`
+> unchanged; only docs and branding use the fuller name.
 
 1. **Privacy gate** — a deterministic scan blocks, reroutes, or redacts sensitive content
    before it can leave for a cloud model or Claude.
@@ -12,7 +16,7 @@ unchanged. Every request passes two gates before it ever reaches a model:
    failing. On local/laptop hardware that saved energy is the difference between a warm fan and
    a dead battery.
 
-> **Attribution.** Deflector is an **independent implementation** inspired by the **AgentStop**
+> **Attribution.** Privacy Deflector is an **independent implementation** inspired by the **AgentStop**
 > concept from **Brave** (early-termination of agent work that will fail, to save resources). It
 > shares none of Brave's code — it was built from scratch — and reuses none of their name for the
 > project. Credit to the original idea and research:
@@ -121,8 +125,8 @@ no secrets.
 
 Copyright (c) 2026 Alex Vargas.
 
-Deflector is licensed under the **Mozilla Public License 2.0** (MPL-2.0) — see `LICENSE`. MPL-2.0
-is file-level (weak) copyleft: **modifications to Deflector's own source files must be released
+Privacy Deflector is licensed under the **Mozilla Public License 2.0** (MPL-2.0) — see `LICENSE`. MPL-2.0
+is file-level (weak) copyleft: **modifications to Privacy Deflector's own source files must be released
 under MPL-2.0**, but you may combine Deflector with other code — including proprietary or
 commercial code — in a "Larger Work" without opening that other code. In short: improve the
 files, share those improvements; build on top, keep your additions however you like.

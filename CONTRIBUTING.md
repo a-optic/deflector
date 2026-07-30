@@ -1,15 +1,36 @@
-# Contributing to Deflector
+# Contributing to Privacy Deflector
 
-Thanks for your interest. Deflector is a privacy-and-efficiency gate for LLM traffic, and
+Thanks for your interest. Privacy Deflector is a privacy-and-efficiency gate for LLM traffic, and
 contributions of all sizes are welcome — bug fixes, tests, docs, new privacy detectors, routing
 tiers, or efficiency heuristics.
 
+## Contribution model
+
+This is a single-maintainer project. There's no formal contributor pipeline, but the door's open:
+
+| Your submission | Commitment |
+|---|---|
+| Follows the format below | ~1 month SLA for review |
+| Doesn't follow the format | Backlog — reviewed as bandwidth allows |
+| Bug fixes / obvious, small, well-tested fixes | Prioritized |
+
+**Format that gets prioritized review:**
+
+- **Title:** `[component] short description` — e.g. `[privacy] fix tier_a boundary regex on unicode input`
+- **Branch:** `feat/<short-desc>` or `fix/<short-desc>`
+- **Commits:** one logical commit per change, no `WIP`/squash-later history
+- **PR body:** use `.github/pull_request_template.md` (What changed / Why it matters / Testing done / Files changed)
+
+If you need something merged faster than the SLA, fork and maintain your own branch — MPL-2.0
+lets you keep downstream modifications private; only changes to *this repo's* files need to come
+back under MPL-2.0 if redistributed.
+
 ## License of contributions
 
-Deflector is licensed under the **Mozilla Public License 2.0** (see `LICENSE`). By submitting a
+Privacy Deflector is licensed under the **Mozilla Public License 2.0** (see `LICENSE`). By submitting a
 contribution you agree it is licensed under MPL-2.0. MPL is file-level copyleft: changes to
-Deflector's own source files stay open under MPL, but the license does not restrict combining
-Deflector with other code in a larger work.
+this repo's own source files stay open under MPL, but the license does not restrict combining
+Privacy Deflector with other code in a larger work.
 
 New source files should carry the MPL header:
 
@@ -21,7 +42,7 @@ New source files should carry the MPL header:
 
 ## Never commit personal data
 
-Deflector is a privacy tool — keep it clean of real identifiers.
+Privacy Deflector is a privacy tool — keep it clean of real identifiers.
 
 - Operator-specific values (your internal domain, names, private IPs) live **only** in
   `private_config.py`, which is **gitignored**. Copy it from the template:
@@ -63,10 +84,14 @@ what CI exercises).
 
 ## Pull requests
 
-1. Fork and branch from `main`.
+1. Fork and branch from `main` using `feat/<desc>` or `fix/<desc>`.
 2. Make focused changes; match the style, naming, and comment density of the surrounding code.
 3. Add or update tests; run the full suite.
-4. Describe what changed and why. Reference any related issue.
+4. Fill out `.github/pull_request_template.md` — title as `[component] short description`.
+5. One logical commit per change; avoid `WIP` or squash-later history.
+
+Properly formatted PRs get a ~1 month review SLA; others land in the backlog. See
+[Contribution model](#contribution-model) above.
 
 ## Reporting privacy or security issues
 
