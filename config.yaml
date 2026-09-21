@@ -1,37 +1,399 @@
 upstream:
   main: http://127.0.0.1:11434
+  # Isolated from `main` so harness traffic (Hermes, OpenJarvis) can never
+  # contend with Pi's heavy, long-context session there. NOT a "light" pool --
+  # Hermes's local tier alone is 23.8GB (verified live via :11435/api/ps) and
+  # OpenJarvis's tier 3 (qwen3-coder:30b) adds another ~19GB.
   tasks: http://127.0.0.1:11435
   cloud: https://ollama.com
+
+  # Which privacy regime each upstream falls under. The label is matched against
+  # ~/.agentstop/provider-trust.yaml; "local" is special-cased as on-box.
+  #
+  # OMITTING A KEY IS SAFE, and that is the entire point: an unlisted upstream is
+  # treated as REMOTE and gets full redaction. This used to be the other way
+  # round -- the destination was `OLLAMA_CLOUD if key == "cloud" else LOCAL`,
+  # so any upstream added later would have been labelled as this machine and
+  # silently skipped Tier B secret blocking and every redaction tier.
+  provider_labels:
+    main:  local
+    tasks: local
+    cloud: ollama-cloud
   timeout_s: 900
   cloud_timeout_s: 600
+  # A cloud model that's simply down sends nothing back at all -- rather than
+  # wait the full cloud_timeout_s (which outlasts a caller's own client-side
+  # timeout, so it just hangs silently for minutes before the caller gives up
+  # and retries into the same dead endpoint), fail fast if the connection or
+  # first/next byte doesn't show up quickly. Only bounds connect + inter-byte
+  # gaps, not total response time, so a slow-but-flowing generation is unaffected.
+  cloud_connect_timeout_s: 10
+  cloud_read_timeout_s: 60
+  # How long to stop escalating to a cloud model that answered with nothing.
+  #
+  # Without this, a tier that accepts connections and returns zero bytes costs
+  # a full cloud_read_timeout_s on EVERY turn before the lane can fall back.
+  # That is what turned a provider outage into an unusable session on
+  # 2026-09-08: six requests, 60s each, and the client retried the identical
+  # prompt until the repeat-guard rejected it.
+  #
+  # One silent response is enough to act on. The lanes this affects are the
+  # *-auto ones, which exist because they name a local model to fall back to,
+  # so a false positive costs only degraded answers until it lapses -- much
+  # cheaper than paying the stall repeatedly. Short on purpose: unreachable is
+  # a claim with a short shelf life, unlike a 410 retirement.
+  cloud_silent_cooldown_s: 300
+  # Local equivalent. The supervisor's idle-gap check can only fire while chunks
+  # are still arriving -- a stream that goes fully silent leaves it blocked on
+  # the socket, so the read timeout is what actually bounds a hard freeze.
+  # Without this, main/tasks used the flat 900s ceiling for that too.
+  #
+  # Generous on purpose: this also covers time-to-first-byte, and a large agent
+  # payload (~120KB seen here) can spend a long time in prefill before emitting
+  # anything. Too low and it would abort healthy long-prefill requests, which
+  # is a worse failure than a slow freeze.
+  #
+  # ORDERING CONSTRAINT: this must exceed thresholds.stall_idle_tools_s (240),
+  # or httpx aborts a legitimately-buffering tool call before the supervisor
+  # ever gets to judge it -- the read timeout would silently become the real
+  # stall policy. At 180 it already did; raised to 270 with that budget.
+  local_read_timeout_s: 270
 
 routing:
   main_models:
     - pi-qwen3.6-128k
-    - llama4:latest
+    - llama4:latest      # kept routable, but hidden from the dropdown 2026-09:
+                         # vision measured 0/3 even on the easy shape image, and
+                         # laguna beat it on the long-context retrieval it existed
+                         # for (287s vs 383s at the same 66.5GB).
     - qwen3.6:35b-a3b
     - hermes-qwen3.6-64k:latest
+    # Routable by explicit id only -- deliberately NOT in the pi_clients dropdown
+    # (2026-09-21), same as llama4 above. Evidence kept here because the dropdown
+    # entry that carried it is gone: it retrieved a needle from a 567,291-char
+    # prompt in 287s vs llama4's 383s at equal RAM, which is why it is kept at
+    # all. Against that: coding 0.63 despite vendor "agentic coding" billing,
+    # leaks reasoning, very verbose (one answer ran 12,077 chars) -- and at
+    # 66.2GB resident it was the largest single contributor to the 2026-09-20
+    # panic. Worth asking for by name on a genuine long-document job; never the
+    # thing that should be loaded because a dropdown made it easy.
+    - laguna-s-2.1:nvfp4          # 66.2GB; fastest long-context retrieval measured
+    - qwen3.8-flash-next:125b-mlx # 105.5GB -- monopolizes the box, deliberate pick only
 
   hermes_model: hermes-qwen3.6-64k
   hermes_cloud_model: nemotron-3-ultra:cloud
 
+  # Models whose chain-of-thought is suppressed by DEFAULT. Measured on the
+  # local coding lane at a realistic ~44KB agent payload: thinking accounted
+  # for ~60% of wall time (18.8s -> 7.5s with it off) and ~94% of emitted
+  # chunks, for a one-sentence answer -- a bad trade on a tool-loop model
+  # that's called dozens of times per task.
+  #
+  # The suppression field is PATH-DEPENDENT, which is why this is a list here
+  # rather than a hardcoded special case: Ollama honors `think: false` only on
+  # its native /api/* endpoints and silently IGNORES it on the OpenAI-compat
+  # /v1 path (verified: 157 reasoning chunks still emitted), where the working
+  # lever is `reasoning_effort: "none"` instead. Clients like Pi use /v1, so a
+  # native-only toggle is a no-op for them.
+  #
+  # Per-request override, to raise thinking back up mid-session:
+  #   header  X-Deflector-Think: low | medium | high   (or: off)
+  # An explicit `reasoning_effort`/`think` already in the request body always
+  # wins over both this default and the header.
+  # Upstream refusals that take a model OUT of the /pi/models.json dropdown.
+  # Keyed by status because the refusals are not equivalent (verbatim bodies):
+  #   402 "this model requires a subscription or extra usage"   -> account state
+  #   429 "you (<account>) have reached your session usage limit" -> account state
+  #   410 "qwen3-coder:480b was retired at 2026-07-15"          -> gone for good
+  # 402/429 clear on their own, so they get a timed cooldown. 410 is retirement:
+  # a timed cooldown would put a permanently-dead model back in the dropdown
+  # every day forever, so it stays hidden until cleared by hand with
+  #   scripts/deflector-cooldowns.py --clear <model>
+  model_cooldowns:
+    402: 86400      # 24h
+    429: 86400      # 24h
+    410: permanent
+
+  # CORRECTED 2026-09-20 after measuring the ACCURACY side of this trade, which
+  # the latency numbers above never covered. On a 4-problem multi-step reasoning
+  # set, suppressing thinking cost:
+  #   qwen3.6:35b-a3b / pi-qwen3.6-128k / hermes-qwen3.6-64k   1.00 -> 0.50
+  #   glm-4.7-flash / qwen3.5:4b                               1.00 -> 0.00
+  #   lfm2.5 / qwen3-coder:30b                                 1.00 -> 1.00  (no cost)
+  # All three Qwen3.6 models were previously listed here and were silently
+  # losing half their reasoning accuracy to buy the speedup. Only models that
+  # measured ZERO accuracy cost stay in this list.
+  #
+  # This list is ONLY for models that CAN think but shouldn't by default.
+  # qwen3-coder:30b is deliberately absent despite also measuring 0.00 cost: it
+  # has no thinking mode at all, so suppressing it is a no-op, and listing it
+  # would contradict its own `reasoning: false` catalog flag (caught by
+  # test_think_policy.py::TestPiModelsCatalog::test_thinking_models_are_marked).
+  #
+  # lfm2.5 stays, but note it does not fully work: it emits <think> blocks into
+  # the response body that Ollama does not parse, and `think: false` does NOT
+  # suppress them (verified) -- that one needs client-side stripping.
+  think_off_models:
+    - lfm2.5:latest      # 0.00 accuracy cost, but see leak caveat above
+
   jarvis_models:
-    - lfm2.5:8b
+    - lfm2.5:latest      # was lfm2.5:8b -- nothing has ever sent :8b; the
+                         # pi_clients dropdown below already said :latest
     - qwen3.5:4b
-    - glm-4.7-flash
+    - qwen3.5:9b         # added 2026-09: 3rd-best accuracy-per-GB measured
+    - qwen3-coder:30b    # tier 3, replacing glm-4.7-flash (still valid as a
+                         # direct-request model -- see its dropdown entry below)
+    - orcarouter/Qwen3.8-27B-Uncensored:mlx-8bit  # research/red-team use only
+  # jarvis_cloud_model intentionally unused -- see resolve_routing's
+  # jarvis_cloud_prefix branch (main.py). Kept here so re-enabling cloud
+  # escalation for OpenJarvis-labeled work is a one-line, reviewed change.
   jarvis_cloud_model: nemotron-3-ultra:cloud
   jarvis_cloud_prefix: "cloud/jarvis"
-  jarvis_cloud_fallback: glm-4.7-flash
+  jarvis_cloud_fallback: qwen3-coder:30b
+
+  # Room left for the REPLY when compacting a prompt down to a local model's
+  # window. Ollama's context covers prompt plus generation, so a prompt that
+  # fills the window leaves the answer nowhere to go and Ollama silently drops
+  # the oldest messages to make room -- the same fidelity loss compaction
+  # exists to manage, taken blindly and logged nowhere.
+  #
+  # Matched to the 16000 maxTokens the *-auto lanes advertise below, rounded up.
+  #
+  # This is the ONLY thing the compaction target subtracts. Compacting further
+  # was measured and is a net loss: on qwen3.6:35b-a3b with an 83,030 token
+  # transcript, answering directly took 155.7s while summarizing then answering
+  # took 204.6s. Prefill dominates and the summarizer must prefill the whole
+  # fold, so summarize+answer can never beat answer alone -- and Pi resends the
+  # full history every turn, so the cost never amortizes. Compaction is a fit
+  # mechanism, not a speed one.
+  local_reply_reserve_tokens: 16384
 
   pressure_flag: /tmp/ai-routing.json
   pressure_threshold_pct: 88
 
   lifeos_prefixes:
-    lifeos-cloud-code: minimax-m3:cloud
+    lifeos-cloud-code: nemotron-3-super:cloud
     lifeos-cloud-reason: nemotron-3-super:cloud
-    lifeos-cloud-long: minimax-m3:cloud
+    lifeos-cloud-long: nemotron-3-super:cloud
   lifeos_local_fallback: qwen3.6:35b-a3b
+  # The window this fallback actually has, so an oversized prompt forced here by
+  # a Tier B secret block gets compacted like any other local landing.
+  #
+  # Without these, that path had no size check at all: the dispatch guard was
+  # `if lcr_entry:`, and the generic fallback has no local_cloud_reasoning entry
+  # by definition. A large session carrying a private key went straight to a
+  # model that might not hold it, and Ollama makes room by silently dropping the
+  # OLDEST messages -- losing the start of the conversation with nothing logged.
+  #
+  # Must track OLLAMA_CONTEXT_LENGTH on the `main` tier (131072), not the 128000
+  # the client catalogue advertises: the catalogue figure is what clients are
+  # told they may use, this one is what the server will actually hold.
+  lifeos_local_fallback_context_tokens: 131072
+  lifeos_local_fallback_reply_reserve_tokens: 16384   # qwen3.6:35b-a3b maxTokens
   lifeos_claude_marker: lifeos-claude
+
+  # local-cloud-reasoning: run local until the request is estimated to fill
+  # threshold_pct of the local model's context window, then escalate to cloud
+  # for that request instead. context_tokens must match the server's actual
+  # window for the local model (OLLAMA_CONTEXT_LENGTH / num_ctx override).
+  local_cloud_reasoning:
+    # threshold_pct was 75 (== ~98k tokens): a realistic agent request runs
+    # ~11k tokens, so escalation effectively never fired and these "-auto"
+    # lanes were local-always despite the "cloud" naming. Local prefill of
+    # that payload measured ~6.6s per round trip vs ~4.9s on cloud, and that
+    # cost is paid on EVERY hop of a multi-step tool loop. 45% (~59k tokens)
+    # keeps short/cheap work local while letting genuinely large contexts --
+    # where local prefill hurts most -- reach the cloud model.
+    lifeos-cloud-reason-auto:
+      local_model: pi-qwen3.6-128k
+      cloud_model: nemotron-3-super:cloud
+      context_tokens: 131072
+      threshold_pct: 45
+      # Matches pi-qwen3.6-128k's advertised maxTokens below. Per-lane rather
+      # than one global value because over-reserving is not free: it makes
+      # compaction fire earlier, and compaction costs a full summarizer prefill
+      # every turn (see local_reply_reserve_tokens).
+      reply_reserve_tokens: 32768
+    lifeos-cloud-code-auto:
+      local_model: qwen3.6:35b-a3b
+      cloud_model: nemotron-3-super:cloud
+      context_tokens: 131072
+      threshold_pct: 45
+      reply_reserve_tokens: 16384      # matches qwen3.6:35b-a3b's maxTokens
+
+  # Single source of truth for thin-client model dropdowns (e.g. PAI Pi on the
+  # M4 mini). Served as-is via GET /pi/models.json — clients pull this instead
+  # of carrying a manually-maintained local copy. Add a model here once; every
+  # thin client picks it up on its next refresh, no per-machine push needed.
+  pi_clients:
+    agentstop:
+      # host filled in from private_config.PI_HOST at serve time (see main.py);
+      # kept out of this committed file so the real LAN IP never lands in git.
+      port: 11500
+      path: "/v1"
+      api: "openai-completions"
+      api_key: "ollama"
+      compat:
+        supportsDeveloperRole: false
+        # TRUE so the client can send its own `reasoning_effort`, which wins
+        # over think_off_models below (precedence rule 1 in _apply_think_policy).
+        # With this false, thinking was unreachable from the client: the default
+        # policy set `reasoning_effort: "none"` and the client had no way to say
+        # otherwise, so every Pi response showed no chain-of-thought and looked
+        # like the proxy was stripping it. It was not -- forwarding is
+        # unconditional; there was simply no lever on this side of the wire.
+        supportsReasoningEffort: true
+      # `reasoning: true` marks a model as ABLE to think, and the Pi client
+      # requires it in addition to supportsReasoningEffort above -- it gates on
+      # `options.reasoningEffort && model.reasoning && compat.supports...`, so a
+      # model without it silently never receives reasoning_effort.
+      #
+      # Set from a probe of every model on 2026-08-30, not by guessing, because
+      # it is NOT safe to blanket-enable: llama4 answers normally without the
+      # field but returns 400 when it is sent. Omitted == false.
+      # LOCAL MODEL NAMES ARE BENCHMARK-DERIVED (measured 2026-09-19/20 on the
+      # Studio, 5 rounds: coding reliability n=3, reasoning, categorization,
+      # obscure-fact QA, hallucination traps, vision, creative-constraint,
+      # plus RAM and GPU-compute-seconds per model). Names state what each model
+      # MEASURED best at, not what its vendor claims -- several vendor claims did
+      # not reproduce. Do not rename these back to marketing labels without
+      # re-running the benchmark.
+      #
+      # Ordering is deliberate: everyday picks first, heavyweights last.
+      #
+      # `llama4:latest` and `ornith-1.5:35b` are intentionally NOT listed:
+      #   llama4      vision measured 0/3 even on the easy image, and laguna beat
+      #               it on long-context retrieval (287s vs 383s, same 66.5GB)
+      #   ornith-1.5  strictly dominated by hermes at the identical 23.9GB
+      # Both remain installed and routable for direct requests.
+      models:
+        - id: hermes-qwen3.6-64k
+          name: "Best Overall - Code, Reasoning & Vision (36B)"
+          contextWindow: 131072
+          maxTokens: 8192
+          reasoning: true
+        # No thinking mode at all -- `reasoning` omitted on purpose.
+        # Cheapest compute measured by far (whole suite in 5 GPU-seconds,
+        # 26x the accuracy-per-GPU-second of anything else), and its WORST
+        # coding run was still 0.80. But worst hallucination resistance
+        # measured (0.33): it invented both a fake theorem and a fake film.
+        - id: "qwen3-coder:30b"
+          name: "Fast Coder - cheapest compute (30B, weak on facts)"
+          contextWindow: 131072
+          maxTokens: 16000
+        # Fastest model measured by 2.4x (214 tok/s). Coding 0.00 across 3
+        # attempts -- genuinely not a coding model. Leaks <think> into the
+        # response body and `think: false` does NOT fix it (see think_off_models).
+        - id: "lfm2.5:latest"
+          name: "Instant Classify & Lookup (8B, fastest)"
+          contextWindow: 128000
+          maxTokens: 4096
+          reasoning: true
+        # 192K verified end-to-end: needle retrieved at 182,542 real tokens for
+        # +3GB RAM. Requires BOTH the ollama-main daemon at 196608 and this
+        # model's own `PARAMETER num_ctx` raised -- the Modelfile default caps it.
+        - id: pi-qwen3.6-128k
+          name: "Pi Orchestrator - default session (36B, 192K)"
+          contextWindow: 196608
+          maxTokens: 32000
+          reasoning: true
+        - id: "qwen3.6:35b-a3b"
+          name: "All-Round + Vision (36B)"
+          contextWindow: 131072
+          maxTokens: 16000
+          reasoning: true
+        # Best accuracy-per-GB of all 13 (0.1410) at the smallest footprint
+        # (6.5GB) -- but 577 GPU-seconds, the HIGHEST of any model. It thinks
+        # enormously for its size: cheap in RAM, expensive in time.
+        - id: "qwen3.5:4b"
+          name: "Best Value - top accuracy per GB (4B, slow)"
+          contextWindow: 131072
+          maxTokens: 8192
+          reasoning: true
+        # Fastest summary measured (17.8s vs 40.3s). No vision capability.
+        # Loses 100% of reasoning accuracy if thinking is suppressed -- which is
+        # why it is deliberately NOT in think_off_models.
+        - id: glm-4.7-flash
+          name: "Fast Summaries & Drafts (30B, no vision)"
+          contextWindow: 131072
+          maxTokens: 8192
+          reasoning: true
+        - id: "qwen3.5:9b"
+          name: "Low-RAM General Use (9B, 8.8GB)"
+          contextWindow: 131072
+          maxTokens: 8192
+          reasoning: true
+        # Accurate (coding 3/3, traps 1.00) but the SLOWEST model tested at
+        # 15.8 tok/s, and its own publisher disclaims production/end-user use.
+        - id: "orcarouter/Qwen3.8-27B-Uncensored:mlx-8bit"
+          name: "Uncensored - research use only (27B, slowest)"
+          contextWindow: 131072
+          maxTokens: 16000
+          reasoning: true
+        # Ties hermes for best overall (1.00) but at 105.5GB -- 4.4x the RAM for
+        # identical accuracy, and the worst accuracy-per-GB of all 13 (0.0095).
+        # Loading this effectively monopolizes the box. Deliberate picks only.
+        - id: "qwen3.8-flash-next:125b-mlx"
+          name: "Flagship - max accuracy, 105GB solo use (180B)"
+          contextWindow: 262144
+          maxTokens: 16000
+          reasoning: true
+        # laguna-s-2.1:nvfp4 REMOVED FROM THIS DROPDOWN 2026-09-21 -- it stays in
+        # routing.main_models, so an explicit request still reaches it; it is only
+        # no longer a one-click pick. Same treatment llama4 already has above, and
+        # for a sharper reason: at 66.2GB it was the single largest contributor to
+        # the 2026-09-20 kernel panic. Selected manually from the Studio, it then
+        # sat pinned by the 24h keep-alive while the tasks lane loaded a 33.8GB
+        # model beneath it -- 129GB resident on a 137GB box, compressor at 100% of
+        # its segment limit, watchdogd starved for 94s. Nothing routine ever asked
+        # for it: the mini has never once requested laguna in the logs.
+        # pi-qwen3.6-128k (23.9GB) is the main-lane default and covers the same
+        # work at a third of the footprint.
+        - id: "qwen3-coder:480b-cloud"
+          name: "Qwen3-Coder 480B (cloud, code/JSON)"
+          contextWindow: 262144
+          maxTokens: 16000
+        - id: "nemotron-3-super:cloud"
+          name: "Nemotron 3 Super (cloud, general reasoning + long-context)"
+          contextWindow: 262144
+          maxTokens: 16000
+          reasoning: true
+        # minimax-m3 removed 2026-08-29: ollama.com now answers
+        # `402 this model requires a subscription or extra usage` for it (glm-5.3
+        # too), which killed Pi sessions the moment they escalated. Everything it
+        # backed moved to nemotron-3-super, which is still on the free tier and
+        # reports the same 262144 context.
+        - id: lifeos-cloud-code
+          name: "LifeOS Cloud Code (routes to nemotron-3-super)"
+          contextWindow: 262144
+          maxTokens: 16000
+          reasoning: true
+        - id: lifeos-cloud-reason
+          name: "LifeOS Cloud Reason (routes to nemotron-3-super)"
+          contextWindow: 131072
+          maxTokens: 16000
+          reasoning: true
+        - id: lifeos-cloud-long
+          name: "LifeOS Cloud Long (routes to nemotron-3-super)"
+          contextWindow: 262144
+          maxTokens: 16000
+          reasoning: true
+        - id: lifeos-cloud-reason-auto
+          name: "LifeOS Cloud Reason Auto (local pi-qwen3.6-128k, >45% ctx to nemotron-3-super)"
+          contextWindow: 131072
+          maxTokens: 16000
+          reasoning: true
+        - id: lifeos-cloud-code-auto
+          name: "LifeOS Cloud Code Auto (local qwen3.6:35b-a3b, >45% ctx to nemotron-3-super)"
+          contextWindow: 131072
+          maxTokens: 16000
+          reasoning: true
+        # lifeos-claude intentionally NOT listed here: Pi has no client-side handling
+        # for the marker (no hook/skill knows it), so selecting it always fails with
+        # a 421 that Pi's HTTP layer surfaces as a generic connection error. Deflector
+        # still 421s it defensively below (routing.lifeos_claude_marker) in case it's
+        # ever requested directly, but it's not offered in the dropdown until there's
+        # an actual local shim on the Pi host to spawn `claude` with tools enabled.
 
 claude:
   # Bucket B (spec 03 §3a): cap in-flight `claude` CLI processes. Each Claude request
@@ -45,10 +407,201 @@ thresholds:
   ngram_window: 64
   ngram_size: 8
   ngram_overlap_ratio: 0.7
-  min_tokens_per_second: 0.5
-  stall_grace_s: 30
+  # Stall = "nothing has happened lately", measured as the gap since the last
+  # activity of ANY kind (content, reasoning, or streamed tool-call arguments).
+  #
+  # This replaced `min_tokens_per_second` / `stall_grace_s`, which compared a
+  # CUMULATIVE AVERAGE (total tokens / total elapsed) against a floor. That was
+  # wrong in both directions: it punished a slow-but-progressing stream for its
+  # own history, and a fast burst followed by a total freeze kept the average
+  # above the floor, so a genuinely hung request survived until
+  # max_wall_seconds. Killed healthy Pi tool-call turns at ~42s.
+  #
+  # 45s is well above the inter-chunk gaps a large local prefill produces, and
+  # far below max_wall_seconds. Only fires once the stream has produced
+  # something (a cold-loading model is not a stalled one).
+  stall_idle_s: 45
+
+  # Allowance for requests that carry `tools`. Enormously larger than the above
+  # because Ollama does NOT stream tool-call arguments incrementally on either
+  # API -- it buffers the entire call and emits it as a single frame when the
+  # model finishes. Measured against Ollama directly, proxy out of the path,
+  # writing a 250-line file into a tool argument:
+  #
+  #     /v1  thinking on    5527 reasoning events, then ONE tool_calls   31s silent
+  #     /v1  thinking on    5579 events                                  42s silent
+  #     /api/chat think off TWO events for the whole response            52s silent
+  #
+  # and the real Pi failure was a 64s window. The silence scales with the size
+  # of what is being written, so there is no useful upper bound and no liveness
+  # signal to be smarter with -- the threshold simply has to exceed legitimate
+  # tool-call time. Only requests WITH tools pay this; ordinary generation
+  # streams token-by-token and keeps the tight 45s.
+  #
+  # 240 is deliberately under Pi's own 300s httpIdleTimeoutMs, so a genuinely
+  # dead request still comes back as a clean finish_reason the client can
+  # report rather than a bare socket timeout.
+  #
+  # MUST stay below upstream.local_read_timeout_s -- see the note there.
+  stall_idle_tools_s: 240
 
 logging:
   log_dir: ~/.agentstop/logs
   log_kills: true
   log_routing: true
+  # requests.jsonl -- metadata-only request trace (shape + timing, never
+  # content). Records arrival separately from body-read and from response
+  # headers, so a request that stalls BEFORE the handler's first log line is
+  # distinguishable from one that stalls downstream. Added after a class of
+  # stall proved invisible to every other log: no routing entry, no gate
+  # decision, no upstream call -- the only evidence was an ESTABLISHED socket
+  # and an idle process.
+  log_request_trace: true
+
+  # Retention. Log files are date-stamped (UTC) so pruning deletes whole files
+  # rather than rewriting one that is being appended to. UTC deliberately:
+  # every `ts` in these files is time.time(), so a local-time filename would
+  # drift out of alignment with the records inside -- exactly the trap you'd
+  # hit debugging an overnight incident.
+  #
+  # SAFETY: ~/.agentstop/logs is SHARED with ~8 other producers (LifeOS skill
+  # daemons, the pressure daemon, the firewall-approval job) and with this
+  # daemon's own launchd stdout/stderr redirect targets, which launchd holds
+  # open -- unlinking one does not error, it silently sends all future output
+  # to a deleted inode. The sweep therefore deletes ONLY an allowlist of exact
+  # filenames this service owns (see retention.py). Everything else is left
+  # alone unconditionally, regardless of age.
+  #
+  # stdout.log / stderr.log are explicitly NOT managed here; they need
+  # newsyslog/copytruncate, not unlink.
+  retention_metadata_days: 14
+  retention_capture_days: 7
+  retention_sweep_interval_s: 3600
+
+# Opt-in, end-to-end encrypted request capture. OFF by default.
+#
+# The server encrypts to a PUBLIC certificate and holds no private key, so it
+# cannot read what it wrote. The private key lives on the client machine. This
+# is sound because a client already possesses everything in its own request and
+# response -- encrypting that back to that client's key tells the key holder
+# nothing new, while removing the server's ability to read it.
+#
+# Two ways a client is identified. Preferred: it enrols its own certificate at
+# POST /capture/enroll and then names the returned FINGERPRINT in the capture
+# header. That survives DHCP -- an IP-keyed recipient stops capturing the
+# moment the lease moves, silently.
+#
+# `recipients` below is the older IP-keyed path, still honoured for
+# `X-Deflector-Capture: 1`. An earlier note here claimed IP-keying was needed
+# because "a header-only opt-in would let any host have ITS traffic encrypted
+# to somebody else's key" -- that reasoning was wrong. Naming someone else's
+# key affects only YOUR request: you hand over your own data and cannot read
+# it back. It cannot redirect a third party's captures, which is what makes
+# zero-touch enrolment safe. See enrollment.py.
+#
+# Decrypt on the client (needs nothing installed -- macOS ships LibreSSL).
+# The private key lives in the client's Keychain, not on disk; the script reads
+# it into memory and pipes it to openssl:
+#   scripts/decrypt-capture.sh <trace>.cms
+#
+# AES-256-CBC is deliberate, not legacy: the client's bundled LibreSSL 3.3.6
+# supports only CBC in CMS. GCM would produce blobs it cannot open.
+#
+# `security cms -D` is not used for decryption, but NOT because it cannot do
+# enveloped data -- an earlier note here claimed that and was wrong. It failed
+# with -8147 (SEC_ERROR_NOT_A_RECIPIENT), a key-LOOKUP failure: the identity
+# sat in a temp keychain outside the decoder's search list. It may well work
+# with a properly imported login-keychain identity; openssl is used because it
+# is already proven against these exact blobs.
+capture:
+  enabled: true
+  # ABSOLUTE path. Under a LaunchDaemon's minimal PATH, bare `openssl` resolves
+  # to /usr/bin/openssl = LibreSSL, which cannot do what we need -- silently.
+  openssl_bin: /opt/homebrew/bin/openssl
+  header: x-deflector-capture
+  # Empty on purpose. Clients enrol themselves and are identified by their
+  # certificate fingerprint, which survives DHCP. Add an entry here only to pin
+  # a client that cannot enrol; it is matched on `X-Deflector-Capture: 1`.
+  recipients: {}
+  # Encrypted to EVERY blob as additional recipients. Configure one from day
+  # one: losing the single private key makes every capture permanently
+  # unreadable, and the failure is silent -- writes keep succeeding.
+  backup_recipients: []
+  max_request_bytes: 524288
+  max_response_bytes: 1048576
+  queue_maxsize: 32
+  workers: 2
+  cms_timeout_s: 10
+
+# Cross-session grounding: pull relevant earlier material out of Open Brain and
+# put it in front of the model.
+#
+# WHERE THIS IS INJECTED IS THE WHOLE SAFETY STORY. The retrieved text is
+# UNREDACTED personal material, and it is placed into the request body AFTER the
+# destination is resolved but BEFORE privacy_evaluate runs (main.py, between
+# `destination = _provider_for(...)` and `decision = privacy_evaluate(...)`).
+#
+#   after routing  -- so retrieval can never change where the request goes. The
+#                     *-auto lanes escalate on prompt SIZE, so injecting earlier
+#                     could push a request past the threshold and CAUSE the
+#                     cloud hop these guardrails exist to make safe.
+#   before the gate -- so anything cloud-bound is redacted exactly like the rest
+#                     of the body. The gate is content-based, not
+#                     provenance-based: privacy/engine.py's _text_slots walks
+#                     every message regardless of role.
+#
+# That placement is what makes "route brain output through the deflector" true
+# by construction rather than by a rule someone has to remember.
+retrieval:
+  enabled: true
+  base_url: http://127.0.0.1:8000
+  # The tier Open Brain ingested with. Identical model means a recomputed
+  # distance matches the stored vector exactly, which is what open_brain.py
+  # relies on. Do NOT point this at the deflector's own port: a request already
+  # inside the deflector calling back into it is a loop, and the privacy gate
+  # short-circuits local destinations anyway.
+  embed_url: http://127.0.0.1:11434
+  embed_model: snowflake-arctic-embed2
+  timeout_s: 5
+
+  # Local destinations: nothing leaves the box, so this is purely a relevance
+  # budget. 0.70 sits in the measured gap -- relevant queries scored 0.367 and
+  # 0.601, unrelated ones 0.800 and 0.885.
+  local:
+    max_results: 5
+    max_distance: 0.70
+    max_injected_tokens: 4000
+
+  # Cloud destinations. Tighter on purpose: the marginal weak hit is the one
+  # most likely to be BOTH irrelevant and sensitive, so it is the one to drop.
+  cloud:
+    max_results: 2
+    max_distance: 0.55
+    max_injected_tokens: 1500
+    # THREAT MODEL: linkability, not sensitivity. The concern is whether content
+    # can be traced back to the operator specifically -- not whether it is
+    # personal. A reflection with no identifiers in it is acceptable to send; a
+    # mundane note carrying a real name is not.
+    #
+    # So this list is deliberately SHORT. An earlier version excluded whole
+    # categories (`private`, `personal`) on sensitivity grounds, which blocked
+    # material the operator does not mind sharing while doing nothing about the
+    # thing that actually matters. What matters is identifier recall, and the
+    # control for that is Tier A -- the operator's exact-match redact list,
+    # which has zero false negatives on its declared set. Presidio (Tier C) is
+    # best-effort and measurably misses: across the 42KB corpus it redacted 27
+    # PERSON and 8 LOCATION and let one real name through in context.
+    #
+    # What stays excluded is the health material. Health data is the category
+    # where re-identification is easiest from quasi-identifiers alone -- a
+    # condition plus an age plus a rough location can single someone out with no
+    # name present at all -- so it does not ride on identifier recall.
+    deny_tags:
+      # Looks truncated -- it isn't. Verified live against Open Brain's
+      # /stats (top_tags): "identity-te" is the genuine stored tag, matching
+      # 9 rows today. Other tags in that same response are longer and
+      # untruncated, so don't "fix" this into identity-team/-tell/etc.
+      - identity-te
+    deny_sources:
+      - health-score
+      - weekly-review-personal

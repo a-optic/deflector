@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import time
 from typing import AsyncIterator
@@ -50,6 +51,27 @@ OUTPUT_CAP = {
     "claude-sonnet-5":  120_000,
     "claude-opus-4-8":  120_000,
 }
+
+
+def _cli_env() -> dict:
+    """The environment for `claude -p`, with ANTHROPIC_API_KEY removed.
+
+    The operator authenticates Claude Code through claude.ai (a Pro subscription);
+    `claude auth status` reports authMethod=claude.ai. That is a FLAT-RATE credential.
+    An API key is a separate, METERED product -- same model, same output, per-token bill.
+
+    ANTHROPIC_API_KEY now exists in the deflector's LaunchDaemon environment (added
+    2026-09-10 for a possible Messages API provider), and subprocesses inherit it.
+    Claude Code resolves an env key ahead of a stored OAuth credential, so leaving it
+    visible would silently move every CLI request off the subscription and onto
+    per-token billing -- with no error, no log line, and identical behaviour. The only
+    symptom would be the invoice.
+
+    Scrubbing one variable is cheaper than detecting that later.
+    """
+    env = dict(os.environ)
+    env.pop("ANTHROPIC_API_KEY", None)
+    return env
 
 
 def _join_segments(content) -> str:
@@ -202,6 +224,7 @@ async def stream_claude(
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
+        env=_cli_env(),
     )
     proc.stdin.write(prompt.encode())
     await proc.stdin.drain()

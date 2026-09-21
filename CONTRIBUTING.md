@@ -57,6 +57,40 @@ Privacy Deflector is a privacy tool — keep it clean of real identifiers.
   ```bash
   git config core.hooksPath scripts/hooks
   ```
+- Real **usernames** count too, and are easy to miss because they hide in paths rather than
+  prose — `/Users/<you>/…`, a launchd `<key>UserName</key>`, a comment naming a file's owner.
+  They live in `OPERATOR_USERNAMES`, separate from `OPERATOR_NAMES`: display names get
+  redacted from *traffic*, login names leak through committed *file content*. Scripts should
+  derive paths from `$0`/`$HOME`; plists ship as templates with `__USER__` / `__HOME__` /
+  `__REPO_DIR__` placeholders, since launchd expands no shell variables inside them.
+
+## Credential-shaped test fixtures are deliberate — do not "fix" them
+
+Several tests contain strings that look exactly like real credentials: AWS access key IDs,
+`ghp_` tokens, `sk-ant-` keys, JWTs, base64 blobs assigned to a variable named `SECRET`.
+**This is intentional and load-bearing.** Deflector's whole job is recognising these shapes,
+so its tests must contain shapes worth recognising. A fixture no scanner would flag is a
+fixture that proves nothing.
+
+A consequence worth stating plainly: **GitHub push protection blocks pushes containing them,
+and that block is the system working.** Two separate detectors fired on this repo's own
+release push — one on the AWS pattern, one on an `api_key: <value>` adjacency — and both were
+resolved as "used in tests" rather than by changing the fixtures. Independent confirmation
+that the test data is realistic is a feature.
+
+So, if you hit a secret-scanning block on this repo:
+
+- **Do not** sanitize the fixture — splitting the literal (`"AKIA" + "ABC…"`), swapping in an
+  obviously-fake value, or deleting the test all silently weaken detector coverage, and the
+  weakening is invisible because the suite still passes.
+- **Do** confirm it is genuinely a fixture and not a real credential, then resolve the alert
+  as *used in tests*.
+- **Do** open an issue if you think a fixture's realism is genuinely unsafe — that is a
+  conversation worth having in public, and the reason these are left visible.
+
+None of this applies to operator PII in the section above. Synthetic credentials are
+deliberate; real identifiers are never acceptable. The difference is whether the string
+points at something that actually exists.
 
 ## Development setup
 

@@ -1,0 +1,76 @@
+# OpenJarvis — M4 mini thin client routing to Mac Studio AgentStop
+#
+# Corrected 2026-09: this runs on the mini, not the Studio, so the engine
+# host must be the Studio's real LAN IP, not loopback -- <STUDIO_LAN_IP>
+# below is a placeholder (this file is tracked; the real address only lives
+# in the deployed copy on the mini itself, never in git).
+#
+# OpenJarvis 1.0.3's IntelligenceConfig has exactly two model fields --
+# default_model and fallback_model, confirmed directly from its installed
+# source (openjarvis/core/config.py). There is no third-tier field to add:
+# `qwen3-coder:30b` (pulled on the Studio for the Deflector's jarvis_models
+# list) is reachable through Pi's manual model dropdown ("Jarvis (local,
+# tier 3)"), but OpenJarvis's own default/fallback selection stays 2-tier
+# until a future OpenJarvis version adds a third slot.
+
+[engine]
+default = "ollama"
+
+[engine.ollama]
+host = "http://<STUDIO_LAN_IP>:11500"
+
+[intelligence]
+# These two models ARE the quality floor for private work. lifeos_dispatch
+# routes every `private` request to this harness unconditionally (policy, not a
+# judgement -- see the dispatch skill), so nothing declared private is ever
+# answered by anything outside this block.
+#
+# Tier 1: default — 1B active, fast, tool-calling optimized. Fastest measured by
+# 2.4x (214 tok/s). Coding 0.00 across 3 attempts -- a classifier and lookup
+# model, which is exactly what the dispatch gate uses it for.
+default_model = "lfm2.5:latest"
+# Tier 2: fallback — promoted 2026-09-21 from qwen3.5:4b.
+#
+# 4b holds the best accuracy-per-GB of all 13 measured (0.1410 at 6.5GB), but it
+# buys that with 577 GPU-seconds -- the HIGHEST of any model tested. It thinks
+# enormously for its size: cheap in RAM, expensive in time. 9b measured 3rd-best
+# accuracy-per-GB at roughly double the footprint, which on a 137GB box is not a
+# constraint worth optimising against, and it raises the total-accuracy floor for
+# private work.
+#
+# qwen3-coder:30b was the obvious alternative and is deliberately NOT used here:
+# it wins compute efficiency by 26x and its worst coding run was still 0.80, but
+# its hallucination resistance measured 0.33, the worst of any model -- it
+# invented both a fake theorem and a fake film. The private work this harness
+# serves is weekly reviews, health scores and decision-helper: factual synthesis
+# about the operator's own life, where invention is the worst available failure.
+# Speed does not compensate for that.
+fallback_model = "qwen3.5:9b"
+temperature = 0.3
+max_tokens = 2048
+
+[agent]
+default_agent = "orchestrator"
+max_turns = 10
+tools = "calculator,think,retrieval"
+context_from_memory = true
+
+[tools.storage]
+default_backend = "sqlite"
+
+[tools.mcp]
+enabled = true
+
+[server]
+host = "127.0.0.1"
+port = 8001
+agent = "orchestrator"
+
+[learning]
+enabled = false
+
+[learning.routing]
+policy = "heuristic"
+
+[telemetry]
+enabled = true

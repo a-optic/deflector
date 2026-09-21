@@ -1,0 +1,699 @@
+#!/usr/bin/python3
+# Pinned to the SYSTEM python on purpose, not `env python3`. A Homebrew python
+# can sit on an external volume, and launching it from a launchd job stalled
+# indefinitely inside dyld -- with no output, because stdout was block
+# buffered. This script is stdlib-only precisely so the stock interpreter is
+# always enough.
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
+"""agentstop -- the Deflector capture client.
+
+    agentstop enroll --server <host>   set this Mac up, once
+    agentstop status                   is it working, and who can read my logs
+    agentstop read                     decrypt and show one of my captures
+    agentstop logs                     server-side timings, outcomes and stalls
+    agentstop backup                   make the backup key, so loss is survivable
+
+Everything here runs on the CLIENT -- the machine that reads captures. Its
+private key lives in the login Keychain and is never written to disk, which is
+why `status` and `read` must run in a GUI session (Terminal at this Mac's own
+screen). `enroll` says so plainly rather than failing obscurely.
+
+Standard library only: this has to run on a stock macOS with no pip install.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import pathlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import urllib.error
+import urllib.request
+
+HOME = pathlib.Path.home()
+AGENTSTOP = HOME / ".agentstop"
+CONFIG = AGENTSTOP / "client.json"
+KEYS = AGENTSTOP / "keys"
+BIN = AGENTSTOP / "bin"
+KEY = KEYS / "pi.key"
+CERT = KEYS / "pi.crt"
+SERVICE = "deflector-capture-key"
+
+BOLD, DIM, RED, GRN, YEL, OFF = (
+    "\033[1m", "\033[2m", "\033[31m", "\033[32m", "\033[33m", "\033[0m"
+) if sys.stdout.isatty() else ("",) * 6
+
+
+def say(msg=""): print(msg)
+def ok(msg): say(f"  {GRN}✓{OFF} {msg}")
+def bad(msg): say(f"  {RED}✗{OFF} {msg}")
+def warn(msg): say(f"  {YEL}!{OFF} {msg}")
+def die(msg, code=1):
+    print(f"{RED}error:{OFF} {msg}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+# --- small helpers ------------------------------------------------------------
+
+def run(cmd, **kw):
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    AGENTSTOP.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG.with_suffix(".part")
+    tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+
+
+def is_gui_session() -> bool:
+    """Keychain reads need an Aqua session; ssh lands in Background."""
+    return run(["launchctl", "managername"]).stdout.strip() == "Aqua"
+
+
+def server_of(args) -> str:
+    host = getattr(args, "server", None) or load_config().get("server")
+    if not host:
+        die("no server configured. Run: agentstop enroll --server <host>")
+    return host
+
+
+def api(host: str, path: str, payload=None, timeout=20):
+    url = f"http://{host}{path}"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data, method="POST" if data else "GET",
+        headers={"Content-Type": "application/json"} if data else {})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            die(f"server returned HTTP {e.code} for {path}")
+    except urllib.error.URLError as e:
+        die(f"cannot reach Deflector at {host}: {e.reason}")
+
+
+def lan_mac(host: str) -> str | None:
+    """MAC of the interface that actually routes to the server.
+
+    Not a hardcoded en0: this Mac may have several interfaces, and the one in
+    use is the only one that means anything. Purely a display label -- the
+    server cannot verify it and does not rely on it.
+    """
+    iface = None
+    for line in run(["route", "-n", "get", host]).stdout.splitlines():
+        if "interface:" in line:
+            iface = line.split(":", 1)[1].strip()
+    if not iface:
+        return None
+    m = re.search(r"ether ([0-9a-f:]{17})", run(["ifconfig", iface]).stdout)
+    return m.group(1) if m else None
+
+
+def find_openssl() -> tuple[str | None, list[str]]:
+    """Locate real OpenSSL. Returns (path or None, what was tried).
+
+    Searches PATH before the well-known prefixes: hardcoding /opt/homebrew
+    wrongly declared a Mac with brew on an external volume incapable of
+    generating a backup key. An explicit DEFLECTOR_OPENSSL is authoritative --
+    naming a binary that is not OpenSSL is an error, not a reason to
+    substitute another.
+    """
+    override = os.environ.get("DEFLECTOR_OPENSSL")
+    if override:
+        cands = [override]
+    else:
+        # EVERY openssl on PATH, not just the first. /usr/bin/openssl
+        # (LibreSSL) usually shadows the real one, so stopping at the first
+        # hit would misreport a machine that has both -- the same mistake as
+        # hardcoding a prefix, one layer down.
+        cands = [os.path.join(d, "openssl")
+                 for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+        cands += ["/opt/homebrew/bin/openssl", "/usr/local/bin/openssl",
+                  "/opt/local/bin/openssl"]
+    tried = []
+    for c in cands:
+        if not c or not os.access(c, os.X_OK):
+            continue
+        ver = run([c, "version"]).stdout.strip()
+        if f"{c} ({ver})" in tried:
+            continue
+        tried.append(f"{c} ({ver})")
+        if ver.startswith("OpenSSL"):
+            return c, tried
+    return None, tried
+
+
+BACKUP_CERT = KEYS / "backup.crt"
+
+
+def register_backup(host: str, fp: str, cert_pem: str) -> bool:
+    """Prove we hold this client's key, then attach a backup recipient.
+
+    The server encrypts a nonce to our own certificate; only our private key
+    opens it. That proof is required because a backup hijack is silent -- an
+    attacker's certificate added here would receive a readable copy of
+    everything while our own decryption carried on working normally.
+    """
+    ch = api(host, "/capture/challenge", {"fp": fp})
+    if "error" in ch:
+        say(f"  {RED}✗{OFF} server would not issue a challenge: {ch['error']}")
+        return False
+
+    tmp = pathlib.Path(f"/tmp/agentstop-challenge-{os.getpid()}.cms")
+    try:
+        tmp.write_bytes(base64.b64decode(ch["cms"]))
+        dec = subprocess.run(
+            [str(BIN / "decrypt-capture.sh"), str(tmp)],
+            capture_output=True,
+            env={**os.environ, "DEFLECTOR_CAPTURE_CERT": str(CERT)})
+    finally:
+        tmp.unlink(missing_ok=True)
+
+    if dec.returncode != 0:
+        say(f"  {RED}✗{OFF} could not answer the challenge:")
+        say("     " + (dec.stderr or b"").decode(errors="replace").strip())
+        say("     (this needs your Keychain, so it must run at this Mac's screen)")
+        return False
+
+    res = api(host, "/capture/backup", {
+        "fp": fp, "challenge_id": ch["challenge_id"],
+        "nonce": base64.b64encode(dec.stdout).decode(), "cert": cert_pem})
+    if "error" in res:
+        say(f"  {RED}✗{OFF} server refused the backup: {res['error']}")
+        return False
+    ok(f"registered with the server (backup id {res['backup_fp'][:12]}...)")
+    return True
+
+
+def keychain_has_key() -> bool:
+    return run(["security", "find-generic-password",
+                "-a", os.environ.get("USER", ""), "-s", SERVICE]).returncode == 0
+
+
+# --- enroll -------------------------------------------------------------------
+
+def cmd_enroll(args):
+    host = getattr(args, "server", None) or load_config().get("server")
+    if not host:
+        die("which server? Run: agentstop enroll --server <host>")
+    if ":" not in host:
+        host = f"{host}:11500"
+
+    say(f"{BOLD}Setting up this Mac as a capture client{OFF}")
+    say(f"  server: {host}")
+    say()
+
+    if not is_gui_session():
+        die("this must run in Terminal at this Mac's own screen.\n"
+            "An ssh session cannot write to the login Keychain "
+            "(you would get 'User interaction is not allowed').")
+
+    KEYS.mkdir(parents=True, exist_ok=True)
+    os.chmod(KEYS, 0o700)
+
+    if keychain_has_key() and CERT.is_file():
+        ok("key already in the Keychain, reusing it")
+    else:
+        if not CERT.is_file() or not KEY.is_file():
+            say("  generating a key pair...")
+            r = run(["openssl", "req", "-x509", "-newkey", "rsa:4096", "-nodes",
+                     "-keyout", str(KEY), "-out", str(CERT), "-days", "3650",
+                     "-subj", "/CN=deflector-capture"])
+            if r.returncode != 0:
+                die(f"could not generate a key pair:\n{r.stderr}")
+            os.chmod(KEY, 0o600)
+        say("  importing into the login Keychain...")
+        imp = subprocess.run([str(BIN / "import-capture-key.sh"), str(KEY)])
+        if imp.returncode != 0:
+            die("Keychain import failed (see above); the key file was left in place")
+        KEY.unlink(missing_ok=True)
+        ok("key stored in the Keychain, key file removed from disk")
+
+    mac = lan_mac(host.split(":")[0])
+    label = run(["scutil", "--get", "ComputerName"]).stdout.strip()
+    res = api(host, "/capture/enroll",
+              {"cert": CERT.read_text(), "mac": mac, "label": label})
+    if "error" in res:
+        die(f"the server refused enrolment: {res['error']}")
+
+    cfg = load_config()
+    cfg.update({"server": host, "fingerprint": res["fingerprint"],
+                "header": res.get("header", "x-deflector-capture"), "mac": mac})
+    save_config(cfg)
+
+    ok(f"enrolled ({res['status']})")
+    say()
+    say(f"  This Mac is {BOLD}{label}{OFF}, MAC {mac or 'unknown'}")
+    say(f"  Its capture id is {res['fingerprint']}")
+    say()
+    say("  Ask for a capture on any request with:")
+    say(f"    {DIM}-H '{cfg['header']}: {res['fingerprint']}'{OFF}")
+    say()
+    say("  Next:  agentstop status")
+
+
+# --- status -------------------------------------------------------------------
+
+def cmd_status(args):
+    cfg = load_config()
+    host = server_of(args)
+    fp = cfg.get("fingerprint")
+    st = api(host, f"/capture/status?fp={fp}" if fp else "/capture/status")
+
+    say(f"{BOLD}Deflector capture{OFF}   server {host}")
+    say()
+
+    if not st.get("enabled"):
+        bad("Capture is switched OFF on the server. Nothing is being recorded.")
+        return 0
+
+    ok("Capture is on.")
+
+    if not fp:
+        warn("This Mac is not enrolled yet.  Run: agentstop enroll")
+    elif st.get("known"):
+        ok(f"This Mac is enrolled ({cfg.get('mac') or 'no MAC recorded'}).")
+    else:
+        bad(f"The server does not recognise this Mac's id ({fp[:12]}...).")
+        say("     Captures you request will NOT be saved. Run: agentstop enroll")
+
+    if keychain_has_key():
+        ok("Your private key is in this Mac's Keychain.")
+    elif is_gui_session():
+        bad("No capture key found in your Keychain. Run: agentstop enroll")
+    else:
+        warn("Cannot check the Keychain from an ssh session (run this at the Mac).")
+
+    say()
+    say(f"{BOLD}Who can read your captures{OFF}")
+    ok("Only this Mac. The server stores them encrypted and holds no key.")
+    if st.get("has_backup"):
+        ok(f"A backup key is registered ({(st.get('backup_fp') or '')[:12]}...), "
+           "so losing this Mac is survivable.")
+        if not BACKUP_CERT.is_file():
+            warn("Test it: agentstop backup --verify   (a backup you have never"
+                 " restored from is not a backup)")
+    elif BACKUP_CERT.is_file():
+        # The dangerous middle state: a key was generated, so it looks done,
+        # but the server never learned about it and is encrypting to one key.
+        bad("A backup key exists here but the server does not have it.")
+        say("     Captures are still encrypted to ONE key.  Run: agentstop backup --register-only")
+    else:
+        bad("No backup key. If this Mac's Keychain item is lost, every capture")
+        say("     becomes permanently unreadable.  Run: agentstop backup --bitwarden")
+    if st.get("global_backups"):
+        ok(f"The server also adds {st['global_backups']} operator backup key(s).")
+
+    say()
+    say(f"{BOLD}Housekeeping{OFF}")
+    say(f"  Captures are deleted after {st.get('capture_retention_days', '?')} days,"
+        f" metadata after {st.get('metadata_retention_days', '?')}.")
+    say(f"  {st.get('enrolled', 0)} machine(s) enrolled on this server.")
+    return 0
+
+
+# --- read ---------------------------------------------------------------------
+
+def _ssh_target(cfg) -> str:
+    t = cfg.get("ssh")
+    if not t:
+        die("reading captures needs ssh access to the server.\n"
+            "Set it once:  agentstop config --ssh <user>@<host>")
+    return t
+
+
+def cmd_read(args):
+    cfg = load_config()
+    target = _ssh_target(cfg)
+    if not is_gui_session():
+        die("decrypting needs your Keychain, so run this in Terminal at this "
+            "Mac's own screen (an ssh session cannot read it).")
+
+    listing = run(["ssh", "-o", "BatchMode=yes", target,
+                   "ls -t ~/.agentstop/logs/capture/*/*.cms 2>/dev/null | head -20"])
+    blobs = [b for b in listing.stdout.split() if b.endswith(".cms")]
+    if not blobs:
+        die("no captures on the server yet. Send a request with the capture "
+            "header first, then try again.")
+
+    if args.trace:
+        match = [b for b in blobs if args.trace in b]
+        if not match:
+            die(f"no recent capture matching {args.trace}")
+        chosen = match[0]
+    elif args.latest or len(blobs) == 1:
+        chosen = blobs[0]
+    else:
+        say(f"{BOLD}Recent captures{OFF}  (newest first)")
+        for i, b in enumerate(blobs[:10], 1):
+            say(f"  {i:>2}. {pathlib.Path(b).stem}")
+        try:
+            pick = input("\nWhich one? [1] ").strip() or "1"
+            chosen = blobs[int(pick) - 1]
+        except (ValueError, IndexError, KeyboardInterrupt, EOFError):
+            die("nothing selected")
+
+    tmp = pathlib.Path(f"/tmp/agentstop-{os.getpid()}.cms")
+    try:
+        if run(["scp", "-q", f"{target}:{chosen}", str(tmp)]).returncode != 0:
+            die("could not download the capture")
+        dec = subprocess.run(
+            [str(BIN / "decrypt-capture.sh"), str(tmp)],
+            capture_output=True, text=True,
+            env={**os.environ, "DEFLECTOR_CAPTURE_CERT": str(CERT)})
+        if dec.returncode != 0:
+            die(f"could not decrypt:\n{dec.stderr.strip()}")
+        try:
+            doc = json.loads(dec.stdout)
+        except ValueError:
+            say(dec.stdout)
+            return 0
+    finally:
+        tmp.unlink(missing_ok=True)   # ciphertext; plaintext never hits disk
+
+    say(f"{BOLD}Capture {doc.get('trace_id')}{OFF}")
+    say(f"  from {doc.get('client')}   model {doc.get('model')}")
+    say()
+    for field, title in (("request_in", "What you sent (before redaction)"),
+                         ("request_upstream", "What actually left the box"),
+                         ("response_out", "What came back")):
+        body = doc.get(field) or ""
+        say(f"{BOLD}{title}{OFF}")
+        say(_pretty(body) if body else f"  {DIM}(empty){OFF}")
+        say()
+    if doc.get("request_in") != doc.get("request_upstream"):
+        warn("The two requests differ -- that difference is what redaction removed.")
+    return 0
+
+
+def _pretty(text: str) -> str:
+    try:
+        return "\n".join("  " + l for l in
+                         json.dumps(json.loads(text), indent=2).splitlines())
+    except ValueError:
+        return "  " + text.replace("\n", "\n  ")
+
+
+# --- backup -------------------------------------------------------------------
+
+def verify_backup(host: str, fp: str) -> int:
+    """Restore-test: decrypt a real capture with the BACKUP key alone.
+
+    The only step that proves the backup works. Everything before it proves
+    the key was stored, not that it opens anything -- and a backup you have
+    never restored from is an assumption, not a backup.
+
+    The key comes from Bitwarden and the passphrase is typed at openssl's
+    prompt; neither is ever written anywhere by this command except a 0600
+    temp file that is shredded on the way out.
+    """
+    st = api(host, f"/capture/status?fp={fp}")
+    if not st.get("has_backup"):
+        die("the server has no backup registered for this Mac.\n"
+            "Run: agentstop backup --bitwarden")
+
+    if not shutil.which("bw"):
+        die("the Bitwarden CLI is not installed:  brew install bitwarden-cli")
+    item = os.environ.get("DEFLECTOR_BW_ITEM", "Deflector capture backup key")
+
+    say(f"{BOLD}Restore test{OFF}  (this is the step that proves the backup works)")
+    say()
+    say(f"  1. fetching '{item}' from Bitwarden...")
+    got = run(["bw", "get", "item", item])
+    if got.returncode != 0:
+        err = (got.stderr or "").strip()
+        if "locked" in err.lower() or "session" in err.lower():
+            die("your Bitwarden vault is locked. Unlock it, then retry:\n"
+                "  export BW_SESSION=$(bw unlock --raw)\n"
+                "  agentstop backup --verify")
+        die(f"could not read that item from Bitwarden: {err}")
+    try:
+        key_pem = json.loads(got.stdout).get("notes") or ""
+    except ValueError:
+        die("that Bitwarden item did not parse as JSON")
+    if "PRIVATE KEY" not in key_pem:
+        die(f"the notes of '{item}' do not look like a private key")
+    ok("retrieved from Bitwarden")
+
+    # Make a capture to restore, so the test uses a real blob rather than a
+    # stale one that might predate the backup being registered.
+    say("  2. making a fresh capture...")
+    marker = f"RESTORE-TEST-{os.getpid()}"
+    body = json.dumps({
+        "model": "lfm2.5:latest", "stream": False, "max_tokens": 8,
+        "messages": [{"role": "user", "content": f"Say OK. {marker}"}]}).encode()
+    req = urllib.request.Request(
+        f"http://{host}/v1/chat/completions", data=body,
+        headers={"Content-Type": "application/json",
+                 "X-Deflector-Capture": fp})
+    try:
+        urllib.request.urlopen(req, timeout=120).read()
+    except Exception as e:
+        die(f"the capture request failed: {e}")
+
+    target = _ssh_target(load_config())
+    blob = run(["ssh", "-o", "BatchMode=yes", target,
+                "ls -t ~/.agentstop/logs/capture/*/*.cms | head -1"]).stdout.strip()
+    if not blob:
+        die("no capture appeared on the server")
+    ok(f"captured {pathlib.Path(blob).stem}")
+
+    keyfile = pathlib.Path(f"/tmp/agentstop-restore-{os.getpid()}.key")
+    local = pathlib.Path(f"/tmp/agentstop-restore-{os.getpid()}.cms")
+    try:
+        keyfile.write_text(key_pem)
+        os.chmod(keyfile, 0o600)
+        if run(["scp", "-q", f"{target}:{blob}", str(local)]).returncode != 0:
+            die("could not download the capture")
+
+        say("  3. decrypting with the BACKUP key only (not your Keychain)...")
+        say(f"     {DIM}openssl will ask for the backup key's passphrase{OFF}")
+        dec = subprocess.run(
+            [str(BIN / "decrypt-capture.sh"), str(local),
+             "--key-file", str(keyfile), "--cert", str(BACKUP_CERT)],
+            capture_output=True, text=True)
+    finally:
+        for f in (keyfile, local):
+            subprocess.run(["rm", "-P", str(f)], capture_output=True)
+
+    if dec.returncode != 0:
+        say()
+        bad("the backup key did NOT decrypt this capture.")
+        say("     " + (dec.stderr or "").strip().replace("\n", "\n     "))
+        say()
+        say("  Your backup does not work. Fix it now, while your primary key")
+        say("  still exists:  agentstop backup --bitwarden")
+        return 1
+
+    if marker not in dec.stdout:
+        bad("decrypted, but the marker is missing -- wrong capture?")
+        return 1
+
+    say()
+    ok("the backup key opened a real capture, containing this test's marker.")
+    say("  Your backup is verified. If this Mac is lost, that key recovers your logs.")
+    return 0
+
+
+def cmd_logs(args):
+    """Run the server's triage view over ssh.
+
+    Flags pass straight through to deflector-logs.py rather than being
+    reimplemented here, so the two can never drift apart.
+
+    Unlike `read`, this touches no Keychain -- trace logs are metadata, not
+    encrypted bodies -- so it works over ssh as well as at the Mac's screen.
+    """
+    cfg = load_config()
+    target = _ssh_target(cfg)
+    repo = cfg.get("server_repo", "~/ai-stack/agentstop-mw")
+
+    passthru = " ".join(shlex.quote(a) for a in args.rest)
+
+    # Quote for the remote shell, but let a leading ~ still mean $HOME --
+    # shlex.quote would turn it into a literal directory named "~".
+    if repo.startswith("~/"):
+        rq = '"$HOME"/' + shlex.quote(repo[2:])
+    else:
+        rq = shlex.quote(repo)
+
+    probe = run(["ssh", "-o", "BatchMode=yes", target,
+                 f"test -f {rq}/scripts/deflector-logs.py && echo ok"])
+    if probe.stdout.strip() != "ok":
+        die(f"deflector-logs.py not found on the server under {repo}\n"
+            f"Point at the right checkout:\n"
+            f"  agentstop config --server-repo /path/to/agentstop-mw")
+
+    # Prefer the repo venv; fall back to the system interpreter so a checkout
+    # without a built venv still works.
+    remote = (f"cd {rq} && "
+              f"{{ [ -x .venv/bin/python ] && PY=.venv/bin/python || PY=/usr/bin/python3; }} && "
+              f"$PY scripts/deflector-logs.py {passthru}")
+    # -t only when we actually have a terminal: it is what makes --follow
+    # interruptible, but forcing it without one just prints a warning.
+    tty = ["-t"] if sys.stdin.isatty() else []
+    return subprocess.run(
+        ["ssh", "-o", "BatchMode=yes", *tty, target, remote]).returncode
+
+
+def cmd_backup(args):
+    script = BIN / "make-backup-key.sh"
+
+    cfg = load_config()
+    if args.verify:
+        fp = cfg.get("fingerprint")
+        if not fp:
+            die("this Mac is not enrolled yet. Run: agentstop enroll")
+        return verify_backup(server_of(args), fp)
+
+    fp = cfg.get("fingerprint")
+    if not fp:
+        die("this Mac is not enrolled yet. Run: agentstop enroll")
+    host = server_of(args)
+
+    # Only GENERATING a key needs real OpenSSL. Registering an existing
+    # certificate does no crypto here, and demanding it anyway blocked retries
+    # on machines where the good openssl is momentarily unreachable.
+    real_openssl, tried = (None, []) if args.register_only else find_openssl()
+
+    if not args.register_only and not real_openssl:
+        say(f"{BOLD}This Mac cannot safely generate the backup key.{OFF}")
+        say()
+        say("  It only has Apple's LibreSSL, which protects a passphrase with an")
+        say("  MD5-based KDF at one iteration -- not real protection. Real OpenSSL")
+        say("  uses PBKDF2; the generator refuses to run without it.")
+        say()
+        say("  Tried:")
+        for t in tried or ["(nothing executable)"]:
+            say(f"    {t}")
+        say()
+        say("  Install it here:   brew install openssl")
+        say("  Non-standard brew prefix? Point at it directly:")
+        say("    DEFLECTOR_OPENSSL=/path/to/bin/openssl agentstop backup")
+        say()
+        say("  Do NOT generate this on the server -- it would put a key that can")
+        say("  read every capture on the one machine that must never hold one.")
+        say("  Full procedure: docs/backup-key.md")
+        return 1
+
+    if not script.is_file():
+        die(f"{script} is missing; re-copy it from the repo's scripts/ directory")
+
+    if not args.register_only:
+        cmd = [str(script), "--cert-out", str(BACKUP_CERT)] + \
+              (["--bitwarden"] if args.bitwarden else [])
+        rc = subprocess.run(
+            cmd, env={**os.environ, "DEFLECTOR_OPENSSL": real_openssl}).returncode
+        if rc != 0:
+            return rc
+
+    if not BACKUP_CERT.is_file():
+        die(f"no backup certificate at {BACKUP_CERT}; nothing to register")
+
+    say()
+    say(f"{BOLD}Telling the server about it{OFF}")
+    if not register_backup(host, fp, BACKUP_CERT.read_text()):
+        say()
+        say("  Your key is safely stored -- only the server registration failed.")
+        say("  Retry without generating another key:")
+        say("    agentstop backup --register-only")
+        return 1
+    say()
+    say("  Captures are now encrypted to BOTH your Keychain key and the backup.")
+    say("  Existing captures are unchanged; this applies from the next one.")
+    return 0
+
+
+# --- config -------------------------------------------------------------------
+
+def cmd_config(args):
+    cfg = load_config()
+    for field in ("server", "ssh", "server_repo"):
+        val = getattr(args, field, None)
+        if val:
+            cfg[field] = val
+    save_config(cfg)
+    say(json.dumps(cfg, indent=2, sort_keys=True))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="agentstop", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    e = sub.add_parser("enroll", help="set this Mac up as a capture client")
+    e.add_argument("--server", help="Deflector host, e.g. 192.0.2.10 or host:11500")
+    e.set_defaults(fn=cmd_enroll)
+
+    s = sub.add_parser("status", help="is it working, and who can read my logs")
+    s.add_argument("--server")
+    s.set_defaults(fn=cmd_status)
+
+    r = sub.add_parser("read", help="decrypt and show one of my captures")
+    r.add_argument("--trace", help="a specific trace id")
+    r.add_argument("--latest", action="store_true", help="skip the menu")
+    r.set_defaults(fn=cmd_read)
+
+    l = sub.add_parser(
+        "logs", help="server-side trace logs: timings, outcomes, stalls",
+        description="Runs the server's deflector-logs.py over ssh. All of its flags work: "
+                    "--summary, --stalls, --id <trace>, --outcome, --client, --limit, --follow. "
+                    "Needs no Keychain, so this one works over ssh too.")
+    l.set_defaults(fn=cmd_logs)   # argv is intercepted in main(); see below
+
+    b = sub.add_parser("backup", help="create the offline backup key")
+    b.add_argument("--bitwarden", action="store_true",
+                   help="store it straight into Bitwarden (needs `bw login` first)")
+    b.add_argument("--verify", action="store_true",
+                   help="restore test: decrypt a real capture with the backup key alone")
+    b.add_argument("--register-only", action="store_true",
+                   help="re-register an existing backup certificate; generates nothing")
+    b.add_argument("--server")
+    b.set_defaults(fn=cmd_backup)
+
+    c = sub.add_parser("config", help="show or set client settings")
+    c.add_argument("--server")
+    c.add_argument("--ssh", help="ssh target for reading captures, user@host")
+    c.add_argument("--server-repo", dest="server_repo",
+                   help="path to the Deflector checkout on the server (for `logs`)")
+    c.set_defaults(fn=cmd_config)
+
+    # `logs` is a pure pass-through to the server's deflector-logs.py, so its
+    # flags must NOT be parsed here -- argparse.REMAINDER does not survive a
+    # subparser (a leading --summary is claimed before it is reached), and
+    # duplicating the flag list would just let the two drift apart.
+    if sys.argv[1:2] == ["logs"]:
+        return cmd_logs(argparse.Namespace(rest=sys.argv[2:]))
+
+    args = ap.parse_args()
+    return args.fn(args) or 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

@@ -24,6 +24,19 @@ INTERNAL_DOMAIN = "example-lab.com"
 # Operator name variants the privacy engine (tier A) redacts/reroutes/blocks.
 OPERATOR_NAMES = ["Jordan Rivers", "Jordan A. Rivers", "J. Rivers"]
 
+# Local macOS account names that appear in absolute paths, launchd UserName keys and
+# log examples (e.g. ["jrivers", "jrivers-mini"]). SEPARATE from OPERATOR_NAMES: those are
+# display names the privacy engine redacts from traffic; these are login names that leak
+# through committed FILE CONTENT -- `/Users/<you>/...`, a plist <key>UserName</key>, a
+# comment naming who owns a file. That gap is not hypothetical: it let three usernames and
+# a machine's directory layout reach a release branch on 2026-09-21, past a hook that was
+# already scanning for the operator's real name, domain and IP.
+OPERATOR_USERNAMES = ["jrivers", "jrivers-mini"]
+
 # A real RFC1918 address from your network, used ONLY as a positive test fixture for the
 # private-IP matcher. Any 10./172.16-31./192.168. address is fine.
 PRIVATE_TEST_IP = "10.0.0.5"
+
+# LAN host thin clients (e.g. PAI Pi) reach Deflector's GET /pi/models.json /
+# OpenAI-compatible endpoints on. Public placeholder defaults to localhost.
+PI_HOST = "127.0.0.1"

@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TEMPLATE. Substitute before installing to /Library/LaunchDaemons:
+	       __USER__      your macOS username (also owns the docker socket)
+	       __HOME__      that user's home directory, e.g. /Users/__USER__
+	       __REPO_DIR__  this checkout, e.g. __HOME__/ai-stack/agentstop-mw
+
+	     launchd does NOT expand $HOME or any shell variable inside these
+	     strings, so these must become literal absolute paths on disk:
+
+	       sed -e "s|__USER__|$USER|g" -e "s|__HOME__|$HOME|g" \
+	           -e "s|__REPO_DIR__|$(pwd)|g" \
+	           scripts/com.deflector.open-brain-ensure.plist \
+	         | sudo tee /Library/LaunchDaemons/com.deflector.open-brain-ensure.plist >/dev/null
+	       sudo launchctl bootstrap system /Library/LaunchDaemons/com.deflector.open-brain-ensure.plist
+
+	     Use bootstrap/bootout to load and reload -- `launchctl kickstart -k`
+	     restarts the job from launchd's CACHED definition, so an edit to this
+	     file on disk would appear to apply and change nothing. -->
+
+	<key>Label</key>
+	<string>com.deflector.open-brain-ensure</string>
+
+	<!-- This box is headless (no GUI login), so a LaunchAgent would not
+	     reliably start here -- must be a LaunchDaemon, which defaults to
+	     running as root. Open Brain's docker socket and project directory
+	     are per-user, so UserName/GroupName are required, not optional. -->
+	<key>UserName</key>
+	<string>__USER__</string>
+	<key>GroupName</key>
+	<string>staff</string>
+
+	<!-- Colima's own LaunchDaemon reporting "started" does not mean the Lima
+	     VM and dockerd inside it are actually ready -- this races that on
+	     every boot. See ensure-open-brain.sh's own header for the full
+	     reasoning (docker-compose.yml already has restart:unless-stopped;
+	     this covers the boot race and periodic self-heal that policy does
+	     not). -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Self-healing poll: if a container ever falls out from under its own
+	     restart policy without a reboot, this notices within the half hour
+	     instead of staying down until someone happens to check. Idempotent,
+	     exits quickly when there is nothing to do. -->
+	<key>StartInterval</key>
+	<integer>1800</integer>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__REPO_DIR__/scripts/ensure-open-brain.sh</string>
+	</array>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/.agentstop/logs/open-brain-ensure.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.agentstop/logs/open-brain-ensure.log</string>
+</dict>
+</plist>

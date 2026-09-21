@@ -11,6 +11,10 @@ unclosed placeholder and flushes on stream end. Only the redact path (trusted cl
 ever carries a mapping; restricted destinations never received the data, local never
 redacted it. An unmatched placeholder is left as-is (never crashes) in case the model
 reformats it.
+
+`rehydrate_complete` is the non-streaming counterpart, for a value that arrived whole
+and so can never split: it needs no buffer, and using RehydrateStream on one would
+withhold a tail that has no later chunk to rejoin.
 """
 
 from __future__ import annotations
@@ -39,3 +43,12 @@ class RehydrateStream:
         out = PLACEHOLDER_RE.sub(lambda m: self.map.get(m.group(), m.group()), self.buf)
         self.buf = ""
         return out
+
+
+def rehydrate_complete(text: str, mapping: dict) -> str:
+    """Restore placeholders in a string that arrived whole (not streamed).
+
+    Same substitution RehydrateStream performs, minus the split-placeholder
+    buffering — safe only when the caller knows the value is complete.
+    """
+    return PLACEHOLDER_RE.sub(lambda m: mapping.get(m.group(), m.group()), text)

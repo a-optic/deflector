@@ -12,3 +12,20 @@ logs/
 
 # operator-private constants — real PII, never commit (see private_config.example.py)
 private_config.py
+
+# Encrypted capture blobs and key material. These live in ~/.agentstop/, not
+# the repo -- this is a backstop so a stray copy can never be committed.
+*.cms
+*.cms.part
+*.crt
+*.key
+*.p12
+
+# Architecture/infra reference docs — real LAN IPs, hostnames, and the
+# operator's network topology, on purpose. Kept accurate locally rather than
+# redacted; never pushed to any remote, including this private one.
+docs/stack/unified-ai-stack-v5.md
+docs/stack/stack-architecture.html
+docs/stack/*openbrain-tunnel.plist
+docs/stack/architecture-reassessment-*.md
+docs/stack/architecture-diagram-*.html

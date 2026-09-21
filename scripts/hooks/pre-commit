@@ -28,7 +28,18 @@ try:
     import private_config as c
 except Exception:
     raise SystemExit(0)
-vals = [c.INTERNAL_DOMAIN, c.PRIVATE_TEST_IP, *c.OPERATOR_NAMES]
+# getattr, not attribute access: a private_config.py written against an older template
+# lacks the newer names, and a hard AttributeError here would abort the hook -- which
+# fails OPEN, letting the very PII it scans for through. Same all-or-nothing trap that
+# private_ref.py documents.
+#
+# OPERATOR_USERNAMES is separate from OPERATOR_NAMES on purpose. Those are display names
+# the privacy engine redacts from TRAFFIC; these are login names that leak through
+# committed FILE CONTENT -- `/Users/<you>/...`, a plist <key>UserName</key>, a comment
+# naming a file's owner. Scanning only display names is why three usernames and a
+# machine's directory layout reached a release branch on 2026-09-21 with this hook green.
+vals = [c.INTERNAL_DOMAIN, c.PRIVATE_TEST_IP,
+        *c.OPERATOR_NAMES, *getattr(c, "OPERATOR_USERNAMES", [])]
 # add the distinctive surname (last token of the canonical name); skip common first names
 if c.OPERATOR_NAMES:
     parts = c.OPERATOR_NAMES[0].split()

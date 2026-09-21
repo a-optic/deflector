@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- TEMPLATE. Substitute before installing to /Library/LaunchDaemons:
+	       __HOME__      your home directory, e.g. /Users/<you>
+	       __REPO_DIR__  this checkout, e.g. __HOME__/ai-stack/agentstop-mw
+
+	     launchd does NOT expand $HOME or any shell variable inside these
+	     strings, so these must become literal absolute paths on disk:
+
+	       sed -e "s|__HOME__|$HOME|g" -e "s|__REPO_DIR__|$(pwd)|g" \
+	           scripts/com.deflector.python-firewall-approve.plist \
+	         | sudo tee /Library/LaunchDaemons/com.deflector.python-firewall-approve.plist >/dev/null
+	       sudo launchctl bootstrap system /Library/LaunchDaemons/com.deflector.python-firewall-approve.plist
+
+	     Use bootstrap/bootout to load and reload -- `launchctl kickstart -k`
+	     restarts the job from launchd's CACHED definition, so an edit to this
+	     file on disk would appear to apply and change nothing.
+
+	     This job runs as root (no UserName key): socketfilterfw requires it. -->
+	<key>Label</key>
+	<string>com.deflector.python-firewall-approve</string>
+
+	<!-- A `brew upgrade python@3.14` creates a new versioned binary path that
+	     the Application Firewall has never approved, and ALF then silently
+	     drops inbound LAN connections to anything that interpreter serves:
+	     the TCP handshake still completes, but zero bytes come back and the
+	     server-side application never runs. Loopback is unaffected, so the
+	     service looks perfectly healthy from the host itself.
+
+	     BOTH paths are watched deliberately. Homebrew extracts into the Cellar
+	     FIRST and runs `brew link` after, and it is the link step that flips
+	     /opt/homebrew/opt/python@3.14 -- which is what the venv actually
+	     resolves through. Watching only the Cellar would fire while realpath
+	     still pointed at the OLD (already-approved) version, do nothing
+	     useful, and then miss the relink entirely, leaving the service dark
+	     until the next reboot. -->
+	<key>WatchPaths</key>
+	<array>
+		<string>/opt/homebrew/Cellar/python@3.14</string>
+		<string>/opt/homebrew/opt</string>
+	</array>
+
+	<!-- Re-assert at boot, in case an upgrade landed while this job was not
+	     loaded. -->
+	<key>RunAtLoad</key>
+	<true/>
+
+	<!-- Self-healing poll: if a trigger is missed or fires at the wrong moment
+	     in a multi-step brew transaction, this corrects it within the hour
+	     instead of waiting for a reboot. The script is idempotent and exits in
+	     milliseconds when there is nothing to do. -->
+	<key>StartInterval</key>
+	<integer>3600</integer>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__REPO_DIR__/scripts/approve-python-firewall.sh</string>
+	</array>
+
+	<key>StandardOutPath</key>
+	<string>__HOME__/.agentstop/logs/python-firewall-approve.log</string>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.agentstop/logs/python-firewall-approve.log</string>
+</dict>
+</plist>

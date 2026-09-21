@@ -44,7 +44,18 @@ def _norm(s: str) -> str:
 def compile_tier_a(entries) -> list[CompiledEntry]:
     compiled: list[CompiledEntry] = []
     for e in entries:
-        vals = sorted({_norm(v) for v in e.get("values", [])}, key=len, reverse=True)
+        # Blank/whitespace-only values are dropped rather than compiled. A blank
+        # contributes an EMPTY branch to the alternation below, and
+        # `(?<!\w)(?:...|)(?!\w)` then matches zero-width at essentially every
+        # position in every scanned request -- observed in production as a
+        # redact-list entry with one blank value peppering every cloud-bound
+        # prompt with placeholders that map to "", which in turn fed Tier B's
+        # entropy detector enough placeholder-dense text to re-wrap whole runs
+        # and corrupt the prompt. An operator typo must not be able to do that.
+        vals = sorted(
+            {n for v in e.get("values", []) if (n := _norm(str(v)).strip())},
+            key=len, reverse=True,
+        )
         if not vals:
             continue
         alt = "|".join(re.escape(v) for v in vals)
@@ -90,6 +101,12 @@ def tier_a_redact(text: str, hits, mapping: dict, nonce: str,
         counters = {}
     out = norm
     for start, end, entry in repls:
+        if end <= start:
+            # Zero-width match: substituting here would inject a placeholder
+            # mapping to "" without removing any text -- pure corruption, and
+            # unbounded (one per position). compile_tier_a now drops the blank
+            # values that cause this, but never splice on one regardless.
+            continue
         counters[entry.placeholder] = counters.get(entry.placeholder, 0) + 1
         ph = f"<PII_{nonce}_{entry.placeholder}_{counters[entry.placeholder]}>"
         mapping[ph] = norm[start:end]

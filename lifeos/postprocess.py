@@ -13,7 +13,7 @@ when the tag is absent so wrappers stay universal.
 
 from __future__ import annotations
 
-_CLOSE = "</think>"
+COT_CLOSE = "</think>"
 
 
 def strip_cot(text: str) -> str:
@@ -22,7 +22,7 @@ def strip_cot(text: str) -> str:
     Returns everything after the last `</think>` occurrence, whitespace-trimmed.
     If the tag is absent, returns the input unchanged (trimmed).
     """
-    idx = text.rfind(_CLOSE)
+    idx = text.rfind(COT_CLOSE)
     if idx == -1:
         return text.strip()
-    return text[idx + len(_CLOSE):].strip()
+    return text[idx + len(COT_CLOSE):].strip()
