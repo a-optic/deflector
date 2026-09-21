@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>AGENTSTOP</key>
+		<string>__AGENTSTOP_URL__</string>
+		<key>BRAIN_URL</key>
+		<string>__BRAIN_URL__</string>
+		<key>HOME</key>
+		<string>__HOME__</string>
+		<key>LOG_DIR</key>
+		<string>__HOME__/.agentstop/logs</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>KeepAlive</key>
+	<false/>
+	<key>Label</key>
+	<string>com.example.lifeos.weekly-review-personal</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>__SKILLS_DIR__/weekly-review-personal/run.sh</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>__HOME__/.agentstop/logs/weekly-review-personal.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>__HOME__/.agentstop/logs/weekly-review-personal.stdout.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>18</integer>
+		<key>Minute</key>
+		<integer>0</integer>
+		<key>Weekday</key>
+		<integer>0</integer>
+	</dict>
+	<key>WorkingDirectory</key>
+	<string>__HOME__</string>
+</dict>
+</plist>

@@ -24,7 +24,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from budget import estimate_prompt_tokens, over_budget
 from lifeos.compact import compact_messages
-from lifeos.postprocess import strip_cot
+from postprocess import strip_cot
 from lifeos.prefilter import (
     has_block as _lifeos_has_block,
     redact as _lifeos_redact,

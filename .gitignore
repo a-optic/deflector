@@ -29,3 +29,9 @@ docs/stack/stack-architecture.html
 docs/stack/*openbrain-tunnel.plist
 docs/stack/architecture-reassessment-*.md
 docs/stack/architecture-diagram-*.html
+
+# TELOS holds deeply personal content and must never be committed. The template
+# (TELOS.template.md) is the schema only and stays committable -- these rules match
+# the exact basename, not a glob, so they do not catch it.
+TELOS.md
+**/TELOS.md

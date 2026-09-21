@@ -19,7 +19,7 @@ This is not a bug list. Everything here works; these are known trade-offs.
 **Status:** deliberate, 2026-09-21. Revisit only if automatic model selection
 needs to adapt to load again.
 
-**What it does now.** `lifeos_pick_tier_c` (`docs/stack/lifeos-call.sh`) returns
+**What it does now.** `lifeos_pick_tier_c` (`lifeos/client/skills/_lib/call.sh`) returns
 exactly two models: `qwen3.6:35b-a3b` for `pref=speed` on short content, and
 `pi-qwen3.6-128k` for everything else. It no longer reads free RAM at all.
 

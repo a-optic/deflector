@@ -20,6 +20,20 @@ if git diff --cached --name-only | grep -qx 'private_config.py'; then
   exit 1
 fi
 
+# 1b. never allow a filled-in TELOS. It is the single most personal document this
+# stack touches -- identity, bright lines, health floors, family commitments -- and
+# lifeos/client/ now sits right beside where it lives, so an accidental `git add`
+# is a plausible mistake rather than a theoretical one. .gitignore also covers it;
+# this is the backstop for an explicit `git add -f`.
+#
+# Matches the exact basename, so TELOS.template.md (the schema, no content) stays
+# committable -- that file is what makes the client kit usable at all.
+if git diff --cached --name-only | grep -qE '(^|/)TELOS\.md$'; then
+  echo "pre-commit: refusing to commit TELOS.md (personal content)." >&2
+  echo "            the publishable schema is lifeos/client/TELOS.template.md" >&2
+  exit 1
+fi
+
 # 2. backstop scan (only if the local private file exists)
 [ -f "$repo_root/private_config.py" ] || exit 0
 

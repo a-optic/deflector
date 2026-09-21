@@ -2,9 +2,9 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-"""strip_cot tests. Run: .venv/bin/python -m pytest lifeos/tests/test_postprocess.py -q"""
+"""strip_cot tests. Run: .venv/bin/python -m pytest tests/test_postprocess.py -q"""
 
-from lifeos.postprocess import COT_CLOSE, strip_cot
+from postprocess import COT_CLOSE, strip_cot
 
 
 def test_strips_preamble_before_close_tag():

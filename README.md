@@ -24,6 +24,16 @@ unchanged. Every request passes two gates before it ever reaches a model:
 > - Reference implementation: https://github.com/brave-experiments/AgentStop
 > - Paper: https://arxiv.org/pdf/2605.15206
 
+> **Interoperates with LifeOS.** The `lifeos-*` lanes and the `X-LifeOS-Sensitivity` header
+> exist to serve **LifeOS**, Daniel Miessler's personal-AI harness (formerly *PAI, Personal AI
+> Infrastructure*) — MIT. Deflector is a separate project and contains none of its code; it
+> implements only the server side of that sensitivity contract. A working reference client
+> lives in [`lifeos/client/`](lifeos/client/). Those skills run under **Pi**
+> (`@earendil-works/pi-coding-agent`, MIT), the agent runtime LifeOS uses. Credit for both
+> belongs upstream:
+> - LifeOS: https://github.com/danielmiessler/LifeOS
+> - Pi: https://github.com/earendil-works/pi
+
 ## What it does
 
 ### Privacy gate (Rule 1, absolute precedence)
@@ -37,6 +47,23 @@ Outcome precedence is `block > reroute > redact > proceed`. A separate determini
 (`lifeos/prefilter.py`) flags private-network signals — RFC1918 IPs, your internal domain's
 `lab`/`vpn`/`homelab`/`internal` subdomains, credential shapes — to keep sensitive prompts off
 cloud tiers.
+
+### Declared sensitivity — the `lifeos-*` lanes
+
+`lifeos-cloud-code`, `-reason` and `-long` are **not models**. They are a client contract: a
+caller sends `X-LifeOS-Sensitivity: private|personal|public` and requests one of those lane
+ids, and `lifeos_gate()` decides what actually happens. `private` never escalates. A
+prefilter hit never escalates. Anything else resolves to the real cloud model behind the lane
+(`routing.lifeos_prefixes`), falling back to a local model otherwise.
+
+Sensitivity is **declared, not inferred** — and that is the point. The scan above reads what a
+request *contains*; it cannot know that a prompt concerns someone's private life, because
+nothing in the bytes says so. Only the client knows. So the client asserts it and Deflector
+enforces it server-side, where the caller can no longer influence the outcome.
+
+Any client can speak this contract; nothing about it is LifeOS-specific beyond the name. A
+complete working implementation — twelve skills, scheduling, and the document schema they
+read — is in [`lifeos/client/`](lifeos/client/).
 
 ### Routing + Claude
 - **Claude override** — only the `X-Deflector-Mode` header can route to Claude (the request body
@@ -77,8 +104,14 @@ and are identified by their certificate fingerprint, so nothing breaks when a DH
 ## Chain-of-thought
 
 Thinking is **suppressed by default** for the models listed in `routing.think_off_models`
-(`config.yaml`). Deflector never strips reasoning in transit — forwarding is unconditional —
-it just asks upstream not to produce it.
+(`config.yaml`). The primary mechanism is to ask upstream not to *produce* reasoning, rather
+than to filter it afterwards.
+
+There is one exception, and it is not optional: some models emit reasoning into the response
+body where `think: false` does not suppress it (`lfm2.5` is the current case — see the note
+in `routing.think_off_models`). For those, a **non-streaming** response has everything up to
+the final `</think>` removed before it is returned (`postprocess.strip_cot`). **Streamed
+responses are forwarded untouched** — stripping across chunk boundaries is not attempted.
 
 Precedence, highest first:
 

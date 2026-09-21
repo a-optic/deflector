@@ -1,0 +1,19 @@
+{
+  "_comment": [
+    "Merge these keys into ~/.pi/agent/settings.json -- do not replace that file.",
+    "`skills` is an array: KEEP any paths already there and APPEND the LifeOS one,",
+    "or Pi stops seeing the skills it already loads. Pi discovers a skill by the",
+    "SKILL.md in each subdirectory, so the path points at the parent of the skill",
+    "folders, not at an individual skill.",
+    "`enableSkillCommands` is what exposes them as /slash commands in a session.",
+    "`defaultModel` must name a model your Deflector actually routes -- see",
+    "GET /pi/models.json on the Deflector for the list it serves."
+  ],
+  "enableSkillCommands": true,
+  "skills": [
+    "__HOME__/.pi/skills",
+    "__HOME__/.pi/agent/skills"
+  ],
+  "defaultProvider": "agentstop",
+  "defaultModel": "<a model id your Deflector serves>"
+}
