@@ -391,7 +391,7 @@ Notes worth knowing before changing any of this:
 ## Test
 
 ```bash
-.venv/bin/python -m pytest -q      # 178 passing
+.venv/bin/python -m pytest -q      # 447 passing
 ```
 
 The suite runs with or without `private_config.py` (it falls back to placeholders), so CI needs
@@ -400,7 +400,7 @@ fails the run if anything writes to the real log directory.
 
 ## License
 
-Copyright (c) 2026 Alex Doeman.
+Copyright (c) 2026 Alex Vargas.
 
 Privacy Deflector is licensed under the **Mozilla Public License 2.0** (MPL-2.0) — see `LICENSE`. MPL-2.0
 is file-level (weak) copyleft: **modifications to Privacy Deflector's own source files must be released

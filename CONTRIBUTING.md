@@ -109,8 +109,21 @@ uv pip install -p .venv/bin/python fastapi uvicorn httpx pyyaml tiktoken
 
 Keep the suite green and add tests for new behavior:
 
+Tests live in a `tests/` directory at every level: `tests/` at the repo root covers the
+top-level modules, and each package keeps its own — `privacy/tests/`, `lifeos/tests/`,
+`providers/tests/`. A new package adds its own `tests/`; discovery walks the tree, so
+nothing needs registering.
+
+`conftest.py` stays at the **repo root** on purpose. Its autouse fixtures apply to every
+test beneath it — they redirect `LOG_DIR` away from the operator's real log directory and
+disable live retrieval, both of which exist because tests once wrote real telemetry and
+pulled personal memories into pytest output. Moved into `tests/`, it would silently stop
+covering the package suites. `pytest.ini` puts the repo root on `sys.path` so that
+`import main` does not depend on where conftest.py happens to sit.
+
+
 ```bash
-.venv/bin/python -m pytest -q      # 48 passing
+.venv/bin/python -m pytest -q      # 447 passing
 ```
 
 Tests must pass **with and without** `private_config.py` present (the placeholder fallback path is
